@@ -29,7 +29,8 @@ use std::time::Duration;
 pub use client::{Client, Entry};
 pub use resp::Value;
 pub use session::Session;
-use transport::error::Result;
+use transport::error::{Result, protocol_error};
+use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
 use transport::{Arrived, Directions, Transport};
 
@@ -40,6 +41,22 @@ pub struct RedisStreamsTransport {
     batch: usize,
     cursor: Mutex<String>,
     timeout: Option<Duration>,
+}
+
+impl Clone for RedisStreamsTransport {
+    /// The same server, stream and field, and the cursor as it stands now
+    /// — a copy reads on from where this one has got to, not from the
+    /// beginning.
+    fn clone(&self) -> Self {
+        Self {
+            server: self.server.clone(),
+            stream: self.stream.clone(),
+            field: self.field.clone(),
+            batch: self.batch,
+            cursor: Mutex::new(self.cursor()),
+            timeout: self.timeout,
+        }
+    }
 }
 
 impl RedisStreamsTransport {
@@ -161,12 +178,101 @@ impl Transport for RedisStreamsTransport {
     }
 }
 
+impl RedisStreamsTransport {
+    /// Both ends on this machine: an ephemeral local port, the stream
+    /// `probe`, the loopback timeout on every read.
+    #[must_use]
+    pub fn loopback() -> Self {
+        Self::new("127.0.0.1:0", "probe").timing_out_after(LOOPBACK_TIMEOUT)
+    }
+}
+
+/// A bound listener waiting for the one producer that appends one entry.
+struct Listening {
+    transport: RedisStreamsTransport,
+    listener: TcpListener,
+    address: String,
+}
+
+impl FarEnd for Listening {
+    fn address(&self) -> &str {
+        &self.address
+    }
+
+    fn take_one(self: Box<Self>) -> Result<Arrived> {
+        self.transport
+            .accept_one(&self.listener)?
+            .next_add()?
+            .ok_or_else(|| protocol_error("the client closed without appending"))
+    }
+}
+
+impl Loopback for RedisStreamsTransport {
+    fn far_end(&self) -> Result<Box<dyn FarEnd>> {
+        let (listener, address) = self.bind()?;
+        Ok(Box::new(Listening {
+            transport: self.clone(),
+            listener,
+            address,
+        }))
+    }
+
+    fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
+        Self::new(address, &self.stream)
+            .in_field(&self.field)
+            .timing_out_after(LOOPBACK_TIMEOUT)
+            .send(&self.stream, payload)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
+    }
+
+    fn edges() -> Vec<(&'static str, Vec<u8>)> {
+        vec![
+            ("empty", Vec::new()),
+            ("one byte", vec![0x2a]),
+            ("every byte", (0..=255).collect()),
+            ("nul run", vec![0; 512]),
+            ("high bytes", vec![0xff; 512]),
+            ("crlf storm", b"\r\n".repeat(400)),
+        ]
+    }
+
+    #[test]
+    fn the_loopback_appends_one_entry_and_takes_it() {
+        let arrived = RedisStreamsTransport::loopback()
+            .round(b"entry")
+            .expect("round");
+        assert_eq!(arrived.bytes, b"entry");
+        assert!(arrived.origin_uri.starts_with("redis://127.0.0.1:"));
+        assert!(arrived.origin_uri.ends_with("/probe/1-0"));
+        let long = vec![0x2a; 100_000];
+        assert_eq!(
+            RedisStreamsTransport::loopback()
+                .round(&long)
+                .expect("long")
+                .bytes,
+            long
+        );
+    }
+
+    #[test]
+    fn the_loopback_returns_the_edge_payloads_whole() {
+        let transport = RedisStreamsTransport::loopback();
+        assert!(transport.ceiling().is_none());
+        for (name, bytes) in edges() {
+            assert!(transport.refuses(&bytes).is_none(), "{name}");
+            let arrived = transport
+                .round(&bytes)
+                .unwrap_or_else(|error| panic!("{name}: {error}"));
+            assert_eq!(arrived.bytes, bytes, "{name}");
+        }
     }
 
     #[test]
