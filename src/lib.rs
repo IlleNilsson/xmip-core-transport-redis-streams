@@ -30,6 +30,7 @@ pub use client::{Client, Entry};
 pub use resp::Value;
 pub use session::Session;
 use transport::error::{Result, protocol_error};
+use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
 use transport::{Arrived, Directions, Transport};
@@ -187,21 +188,9 @@ impl RedisStreamsTransport {
     }
 }
 
-/// A bound listener waiting for the one producer that appends one entry.
-struct Listening {
-    transport: RedisStreamsTransport,
-    listener: TcpListener,
-    address: String,
-}
-
-impl FarEnd for Listening {
-    fn address(&self) -> &str {
-        &self.address
-    }
-
-    fn take_one(self: Box<Self>) -> Result<Arrived> {
-        self.transport
-            .accept_one(&self.listener)?
+impl Accepting for RedisStreamsTransport {
+    fn take_one(&self, listener: &TcpListener) -> Result<Arrived> {
+        self.accept_one(listener)?
             .next_add()?
             .ok_or_else(|| protocol_error("the client closed without appending"))
     }
@@ -210,11 +199,7 @@ impl FarEnd for Listening {
 impl Loopback for RedisStreamsTransport {
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
         let (listener, address) = self.bind()?;
-        Ok(Box::new(Listening {
-            transport: self.clone(),
-            listener,
-            address,
-        }))
+        Ok(Box::new(Listening::new(self.clone(), listener, address)))
     }
 
     fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
@@ -228,20 +213,10 @@ impl Loopback for RedisStreamsTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use transport::payload::edge_payloads;
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
-    }
-
-    fn edges() -> Vec<(&'static str, Vec<u8>)> {
-        vec![
-            ("empty", Vec::new()),
-            ("one byte", vec![0x2a]),
-            ("every byte", (0..=255).collect()),
-            ("nul run", vec![0; 512]),
-            ("high bytes", vec![0xff; 512]),
-            ("crlf storm", b"\r\n".repeat(400)),
-        ]
     }
 
     #[test]
@@ -266,7 +241,7 @@ mod tests {
     fn the_loopback_returns_the_edge_payloads_whole() {
         let transport = RedisStreamsTransport::loopback();
         assert!(transport.ceiling().is_none());
-        for (name, bytes) in edges() {
+        for (name, bytes) in edge_payloads() {
             assert!(transport.refuses(&bytes).is_none(), "{name}");
             let arrived = transport
                 .round(&bytes)
