@@ -189,7 +189,7 @@ impl RedisStreamsTransport {
 }
 
 impl Accepting for RedisStreamsTransport {
-    fn take_one(&self, listener: &TcpListener) -> Result<Arrived> {
+    fn take_one(self, listener: &TcpListener) -> Result<Arrived> {
         self.accept_one(listener)?
             .next_add()?
             .ok_or_else(|| protocol_error("the client closed without appending"))
@@ -198,8 +198,7 @@ impl Accepting for RedisStreamsTransport {
 
 impl Loopback for RedisStreamsTransport {
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
-        let (listener, address) = self.bind()?;
-        Ok(Box::new(Listening::new(self.clone(), listener, address)))
+        Ok(Box::new(Listening::new(self.clone(), self.bind()?)))
     }
 
     fn send_to(&self, address: &str, payload: &[u8]) -> Result<()> {
