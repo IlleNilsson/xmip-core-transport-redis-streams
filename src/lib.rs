@@ -33,7 +33,8 @@ use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
-use transport::{Arrived, Directions, Transport};
+use transport::{Arrived, Configured, Directions, Transport};
+use xcore::settings::{Applies, Kind, Presence, Read, Setting, Settings};
 
 pub struct RedisStreamsTransport {
     server: String,
@@ -179,6 +180,60 @@ impl Transport for RedisStreamsTransport {
     }
 }
 
+impl Configured for RedisStreamsTransport {
+    /// The address is the server, `host:6379`: where a Location connects.
+    const SETTINGS: &'static Settings = &Settings {
+        technology: env!("CARGO_PKG_NAME"),
+        settings: &[
+            Setting {
+                name: "stream",
+                kind: Kind::Text,
+                presence: Presence::Required,
+                meaning: "The stream key a Receive Location reads and a Send Location appends to \
+                          when a target names no stream.",
+                applies: Applies::Both,
+            },
+            Setting {
+                name: "field",
+                kind: Kind::Text,
+                presence: Presence::Optional,
+                meaning: "The entry field that carries the Stream; `body` when left out.",
+                applies: Applies::Both,
+            },
+            Setting {
+                name: "after",
+                kind: Kind::Text,
+                presence: Presence::Optional,
+                meaning: "The entry id a Receive Location starts reading after; the stream's \
+                          beginning when left out.",
+                applies: Applies::Receive,
+            },
+            Setting {
+                name: "timeout",
+                kind: Kind::Duration,
+                presence: Presence::Optional,
+                meaning: "How long a server that stops mid-reply is waited on; unbounded when \
+                          left out.",
+                applies: Applies::Both,
+            },
+        ],
+    };
+
+    fn configured(address: &str, settings: &Read) -> Result<Self> {
+        let mut transport = Self::new(address, settings.text("stream"));
+        if let Some(field) = settings.optional_text("field") {
+            transport = transport.in_field(field);
+        }
+        if let Some(id) = settings.optional_text("after") {
+            transport = transport.after(id);
+        }
+        if let Some(timeout) = settings.optional_duration("timeout") {
+            transport = transport.timing_out_after(timeout);
+        }
+        Ok(transport)
+    }
+}
+
 impl RedisStreamsTransport {
     /// Both ends on this machine: an ephemeral local port, the stream
     /// `probe`, the loopback timeout on every read.
@@ -216,6 +271,31 @@ mod tests {
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
+    }
+
+    #[test]
+    fn redis_streams_declares_its_settings_and_reads_through_them() {
+        use xcore::settings::Given;
+        assert_eq!(
+            RedisStreamsTransport::SETTINGS.problems(),
+            Vec::<String>::new()
+        );
+        let given = [
+            ("stream".to_string(), Given::Text("orders".to_string())),
+            ("field".to_string(), Given::Text("payload".to_string())),
+            ("after".to_string(), Given::Text("5-0".to_string())),
+            ("timeout".to_string(), Given::Text("2s".to_string())),
+        ];
+        let built = RedisStreamsTransport::open("server:6379", Applies::Receive, &given)
+            .expect("configured");
+        assert_eq!(built.stream, "orders");
+        assert_eq!(built.field, "payload");
+        assert_eq!(built.cursor(), "5-0");
+        assert_eq!(built.timeout, Some(secs(2)));
+        let Err(refused) = RedisStreamsTransport::open("server:6379", Applies::Send, &given) else {
+            panic!("a Send Location reads no cursor");
+        };
+        assert!(refused.message.contains("\"after\""), "{refused}");
     }
 
     #[test]
