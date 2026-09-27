@@ -33,7 +33,7 @@ use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
-use transport::{Arrived, Configured, Directions, Transport};
+use transport::{Arrived, Configured, Directions, Pool, Transport};
 use xcore::settings::{Applies, Kind, Presence, Read, Setting, Settings};
 
 pub struct RedisStreamsTransport {
@@ -43,12 +43,15 @@ pub struct RedisStreamsTransport {
     batch: usize,
     cursor: Mutex<String>,
     timeout: Option<Duration>,
+    /// The connections a send appends on, connected once per server and
+    /// kept.
+    clients: Pool<Client>,
 }
 
 impl Clone for RedisStreamsTransport {
     /// The same server, stream and field, and the cursor as it stands now
     /// — a copy reads on from where this one has got to, not from the
-    /// beginning.
+    /// beginning. The kept connections are shared.
     fn clone(&self) -> Self {
         Self {
             server: self.server.clone(),
@@ -57,6 +60,7 @@ impl Clone for RedisStreamsTransport {
             batch: self.batch,
             cursor: Mutex::new(self.cursor()),
             timeout: self.timeout,
+            clients: self.clients.clone(),
         }
     }
 }
@@ -73,6 +77,7 @@ impl RedisStreamsTransport {
             batch: 100,
             cursor: Mutex::new("0-0".to_string()),
             timeout: None,
+            clients: Pool::new(),
         }
     }
 
@@ -173,10 +178,15 @@ impl Transport for RedisStreamsTransport {
         Ok(arrived)
     }
 
+    /// XADD on the connection kept for the server, connected on the first
+    /// send to it.
     fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
         let (server, stream) = self.resolve(target);
-        let mut client = Client::connect(server, self.timeout)?;
-        client.add(stream, &[(&self.field, bytes)]).map(|_| ())
+        self.clients.exchange(
+            server,
+            || Client::connect(server, self.timeout),
+            |client| client.add(stream, &[(&self.field, bytes)]).map(|_| ()),
+        )
     }
 }
 
@@ -343,15 +353,15 @@ mod tests {
             let rest = near.receive()?;
             Ok::<_, transport::TransportError>((first, cursor, rest))
         });
+        // One server, so one connection for both sends: connected once.
         let mut session = far_end.accept_one(&listener).expect("accepting");
         let one = session.next_add().expect("first").expect("an entry");
         assert_eq!(one.bytes, b"first");
         assert!(one.origin_uri.ends_with("/orders/1-0"));
-        assert!(session.next_add().expect("closed").is_none());
-        let mut session = far_end.accept_one(&listener).expect("second");
         let two = session.next_add().expect("second").expect("an entry");
         assert_eq!(two.bytes, b"second\r\n\0");
-        assert!(session.next_add().expect("closed").is_none());
+        assert!(two.origin_uri.ends_with("/orders/2-0"));
+        drop(session);
         // Each session keeps its own streams, so the two receives that
         // follow read from fresh sessions and find nothing; a server is what
         // makes what one connection appended visible to the next.

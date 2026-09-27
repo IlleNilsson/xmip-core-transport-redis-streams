@@ -6,6 +6,7 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use transport::error::{Result, TransportError, classify, protocol_error};
+use transport::pool::{Pooled, alive};
 use transport::socket;
 
 use crate::resp::{Value, encode, read};
@@ -28,6 +29,8 @@ impl Entry {
     }
 }
 
+/// One connection to a server, kept between commands while the server
+/// keeps it open.
 pub struct Client {
     reader: BufReader<TcpStream>,
     writer: TcpStream,
@@ -103,6 +106,13 @@ impl Client {
             count.as_bytes(),
         ])?;
         entries(&reply)
+    }
+}
+
+impl Pooled for Client {
+    /// While the server has not closed the connection.
+    fn usable(&mut self) -> bool {
+        alive(&self.writer)
     }
 }
 
