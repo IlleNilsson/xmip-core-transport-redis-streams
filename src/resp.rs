@@ -3,6 +3,7 @@
 
 use std::io::BufRead;
 
+use transport::ceiling;
 use transport::error::{Result, classify, protocol_error};
 
 /// One RESP value.
@@ -96,31 +97,40 @@ fn write(out: &mut Vec<u8>, value: &Value) {
     }
 }
 
+/// The deepest arrays are nested in one value before it is refused: a reply
+/// Redis writes nests four deep at most (XREAD), and a peer sending
+/// `*1` without end would otherwise recurse until the stack overflows.
+pub const MAX_DEPTH: usize = 32;
+
 /// Read one value, or `None` when the peer closed between values.
 ///
 /// # Errors
-/// A connection that closes mid-value, a type byte RESP does not have, or a
-/// length that is not a number.
+/// A connection that closes mid-value, a line over `net::read::MAX_LINE` or
+/// not UTF-8, a type byte RESP does not have, a length that is not a number,
+/// a bulk length over `net::MAX_BODY`, or arrays nested deeper than
+/// [`MAX_DEPTH`].
 pub fn read(reader: &mut impl BufRead) -> Result<Option<Value>> {
-    let mut line = Vec::new();
-    let taken = reader
-        .read_until(b'\n', &mut line)
-        .map_err(|e| classify("reading a RESP line", &e))?;
-    if taken == 0 {
+    nested(reader, 0)
+}
+
+/// One value `depth` arrays down.
+fn nested(reader: &mut impl BufRead, depth: usize) -> Result<Option<Value>> {
+    let Some(line) = net::read::line(reader)? else {
         return Ok(None);
-    }
-    if !line.ends_with(b"\r\n") || line.len() < 3 {
-        return Err(protocol_error("a RESP line without its CRLF"));
-    }
-    let text = String::from_utf8_lossy(&line[1..line.len() - 2]).into_owned();
-    let value = match line[0] {
+    };
+    let Some(&kind) = line.as_bytes().first() else {
+        return Err(protocol_error("a RESP line without its type byte"));
+    };
+    let text = line.get(1..).unwrap_or_default().to_string();
+    let value = match kind {
         b'+' => Value::Simple(text),
         b'-' => Value::Error(text),
         b':' => Value::Integer(number(&text)?),
         b'$' => match number(&text)? {
             -1 => Value::Bulk(None),
             length if length >= 0 => {
-                let length = usize::try_from(length).unwrap_or(0);
+                let length = usize::try_from(length).unwrap_or(usize::MAX);
+                ceiling::within(length, net::MAX_BODY, "Xmip reads in one bulk string")?;
                 let mut bytes = vec![0u8; length + 2];
                 reader
                     .read_exact(&mut bytes)
@@ -136,9 +146,14 @@ pub fn read(reader: &mut impl BufRead) -> Result<Option<Value>> {
         b'*' => match number(&text)? {
             -1 => Value::Array(None),
             count if count >= 0 => {
+                if depth == MAX_DEPTH {
+                    return Err(protocol_error(format!(
+                        "arrays nested deeper than the {MAX_DEPTH} Xmip reads"
+                    )));
+                }
                 let mut elements = Vec::new();
                 for _ in 0..count {
-                    let element = read(reader)?
+                    let element = nested(reader, depth + 1)?
                         .ok_or_else(|| protocol_error("the peer closed inside an array"))?;
                     elements.push(element);
                 }
@@ -195,7 +210,18 @@ mod tests {
         assert!(read(&mut &b"$5\r\nab\r\n"[..]).is_err(), "short");
         assert!(read(&mut &b"$-2\r\n"[..]).is_err(), "negative");
         assert!(read(&mut &b"*2\r\n+a\r\n"[..]).is_err(), "closed in array");
-        assert!(read(&mut &b"+OK\n"[..]).is_err(), "bare LF");
+        assert!(read(&mut &b"\r\n"[..]).is_err(), "no type byte");
+        let deepest = [b"*1\r\n".repeat(MAX_DEPTH), b":1\r\n".to_vec()].concat();
+        assert!(read(&mut deepest.as_slice()).is_ok(), "at the limit");
+        let endless = b"*1\r\n".repeat(100_000);
+        let refused = read(&mut endless.as_slice()).expect_err("nested past the limit");
+        assert!(
+            refused.message.contains("nested deeper"),
+            "{}",
+            refused.message
+        );
+        let claimed = read(&mut &b"$9223372036854775807\r\n"[..]);
+        assert!(claimed.expect_err("claimed").message.contains("over the"));
         let command = Value::command(&[b"PING"]);
         assert_eq!(
             command.as_array().expect("array")[0].as_text().as_deref(),
