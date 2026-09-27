@@ -2,6 +2,8 @@
 
 Redis Streams transport: one entry is one Stream, the key and id beside it; a Location appends with XADD or reads on from its cursor, or accepts clients directly. RESP2. A technology of [xmip-core-transport](https://github.com/IlleNilsson/xmip-core-transport).
 
+A Send Location appends with XADD on a connection kept per server (`transport::Pool`). Until 2026-09-27 every send connected.
+
 ## Toolchain
 
 `rust-toolchain.toml` pins the toolchain for the whole estate. Do not change it
