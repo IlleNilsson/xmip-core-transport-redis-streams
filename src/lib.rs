@@ -27,6 +27,7 @@ use std::sync::Mutex;
 use std::time::Duration;
 
 pub use client::{Client, Entry};
+use net::Target;
 pub use resp::Value;
 pub use session::Session;
 use transport::error::{Result, protocol_error};
@@ -43,8 +44,8 @@ pub struct RedisStreamsTransport {
     batch: usize,
     cursor: Mutex<String>,
     timeout: Option<Duration>,
-    /// The connections a send appends on, connected once per server and
-    /// kept.
+    /// The connections a send appends on and a receive reads on, connected
+    /// once per server and kept.
     clients: Pool<Client>,
 }
 
@@ -83,7 +84,7 @@ impl RedisStreamsTransport {
 
     /// Carry the Stream in this field rather than `body`.
     #[must_use]
-    pub fn in_field(mut self, field: impl Into<String>) -> Self {
+    fn in_field(mut self, field: impl Into<String>) -> Self {
         self.field = field.into();
         self
     }
@@ -142,7 +143,7 @@ impl RedisStreamsTransport {
     /// `redis://host:6379/orders` — or is a stream alone on this
     /// transport's server.
     fn resolve<'a>(&'a self, target: &'a str) -> (&'a str, &'a str) {
-        match socket::target("redis", target) {
+        match Target::under(&["redis"], target).map(|named| (named.authority(), named.path())) {
             Some((peer, "")) => (peer, &self.stream),
             Some(pair) => pair,
             None => (&self.server, target),
@@ -159,10 +160,14 @@ impl Transport for RedisStreamsTransport {
         Directions::BOTH
     }
 
-    /// The entries after the cursor, the cursor moved to the last of them.
+    /// The entries after the cursor, the cursor moved to the last of them,
+    /// read on the connection kept for the server.
     fn receive(&self) -> Result<Vec<Arrived>> {
-        let mut client = self.connect()?;
-        let entries = client.read_after(&self.stream, &self.cursor(), self.batch)?;
+        let entries = self.clients.exchange(
+            self.server.as_str(),
+            || self.connect(),
+            |client| client.read_after(&self.stream, &self.cursor(), self.batch),
+        )?;
         let mut arrived = Vec::with_capacity(entries.len());
         for entry in entries {
             let body = entry.field(&self.field).unwrap_or(&[]).to_vec();
@@ -351,9 +356,9 @@ mod tests {
             let first = near.receive()?;
             let cursor = near.cursor();
             let rest = near.receive()?;
-            Ok::<_, transport::TransportError>((first, cursor, rest))
+            Ok::<_, transport::TransportError>((first, cursor, rest, near.clients.opened()))
         });
-        // One server, so one connection for both sends: connected once.
+        // One server, so one connection for both sends and both receives.
         let mut session = far_end.accept_one(&listener).expect("accepting");
         let one = session.next_add().expect("first").expect("an entry");
         assert_eq!(one.bytes, b"first");
@@ -361,18 +366,45 @@ mod tests {
         let two = session.next_add().expect("second").expect("an entry");
         assert_eq!(two.bytes, b"second\r\n\0");
         assert!(two.origin_uri.ends_with("/orders/2-0"));
+        assert!(session.next_add().expect("serving the reads").is_none());
+        let (first, cursor, rest, opened) = near.join().expect("thread").expect("round trip");
+        assert_eq!(first.len(), 2, "what the kept connection appended");
+        assert_eq!(first[1].bytes, two.bytes);
+        assert_eq!(cursor, "2-0");
+        assert!(rest.is_empty(), "read on from the cursor");
+        assert_eq!(opened, 1);
+    }
+
+    #[test]
+    fn a_thousand_receives_connect_once_and_a_connection_the_server_closed_is_replaced() {
+        const RECEIVES: usize = 1000;
+        let far_end = RedisStreamsTransport::new("127.0.0.1:0", "orders").timing_out_after(secs(5));
+        let (listener, address) = far_end.bind().expect("binding");
+        let receiving = RedisStreamsTransport::new(address, "orders").timing_out_after(secs(5));
+        let (go, going) = std::sync::mpsc::channel();
+        let receiver = std::thread::spawn(move || {
+            let began = std::time::Instant::now();
+            for _ in 0..RECEIVES {
+                assert!(receiving.receive()?.is_empty());
+            }
+            let took = began.elapsed();
+            // Generous for a debug build under load: a millisecond a read.
+            assert!(took < Duration::from_millis(RECEIVES as u64), "{took:?}");
+            // An append on the same kept connection says the reads are done.
+            receiving.send("orders", b"read")?;
+            going.recv().expect("go");
+            Ok::<_, transport::TransportError>((receiving.receive()?, receiving.clients.opened()))
+        });
+        let mut session = far_end.accept_one(&listener).expect("accepting");
+        let marker = session.next_add().expect("served").expect("the append");
+        assert_eq!(marker.bytes, b"read");
         drop(session);
-        // Each session keeps its own streams, so the two receives that
-        // follow read from fresh sessions and find nothing; a server is what
-        // makes what one connection appended visible to the next.
-        for _ in 0..2 {
-            let mut session = far_end.accept_one(&listener).expect("a reader");
-            assert!(session.next_add().expect("serving").is_none());
-        }
-        let (first, cursor, rest) = near.join().expect("thread").expect("round trip");
-        assert!(first.is_empty(), "a fresh session holds nothing");
-        assert_eq!(cursor, "0-0");
-        assert!(rest.is_empty());
+        go.send(()).expect("went");
+        let mut again = far_end.accept_one(&listener).expect("a new connection");
+        assert!(again.next_add().expect("served").is_none());
+        let (arrived, opened) = receiver.join().expect("thread").expect("read");
+        assert!(arrived.is_empty());
+        assert_eq!(opened, 2);
     }
 
     #[test]
