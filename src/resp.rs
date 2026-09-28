@@ -3,7 +3,7 @@
 
 use std::io::BufRead;
 
-use transport::ceiling;
+use net::ceiling;
 use transport::error::{Result, classify, protocol_error};
 
 /// One RESP value.
