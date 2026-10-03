@@ -11,7 +11,7 @@ use std::io::{BufReader, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::time::Duration;
 
-use transport::Arrived;
+use transport::Taken;
 use transport::error::{Result, classify};
 use transport::socket;
 
@@ -45,12 +45,12 @@ impl Session {
     }
 
     /// The next entry the client appends, or `None` when it closed. Reads
-    /// and pings are answered on the way. The Stream is the entry's first
-    /// field value; the origin names the stream and the id.
+    /// and pings are answered on the way. What is taken is the entry's
+    /// first field value; the origin names the stream and the id.
     ///
     /// # Errors
     /// Where the connection broke, or nothing arrived before the timeout.
-    pub fn next_add(&mut self) -> Result<Option<Arrived>> {
+    pub fn next_add(&mut self) -> Result<Option<Taken>> {
         loop {
             let Some(command) = read(&mut self.reader)? else {
                 return Ok(None);
@@ -92,7 +92,7 @@ impl Session {
                         .push((id.clone(), fields));
                     self.reply(&Value::bulk(&id))?;
                     let origin = format!("redis://{}/{key}/{id}", self.peer);
-                    return Ok(Some(Arrived::new(origin, body)));
+                    return Ok(Some(Taken::new(origin, body)));
                 }
                 "XLEN" => {
                     let length = self.streams.get(&text(1)).map_or(0, Vec::len);
