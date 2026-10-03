@@ -6,9 +6,14 @@
 //! A Redis Stream is an append-only log with ids that order it, on port
 //! 6379: XADD appends, XRANGE and XREAD read on from an id, and the id a
 //! Location last read is its cursor. A Receive Location reads the entries
-//! after its cursor; a Send Location appends. Either may instead accept a
-//! producer or consumer directly through [`Session`], one client's worth of
-//! server over streams kept in memory.
+//! after its cursor, which a read moves nothing of: an entry's
+//! acknowledgement, after the runtime's receive cycle, moves the cursor to
+//! it when accepted or refused for good — only from the entry before it,
+//! so the cursor advances contiguously — and leaves it when the cycle
+//! failed, so the failed entry and those after it are read again. A Send
+//! Location appends. Either may instead accept a producer or consumer
+//! directly through [`Session`], one client's worth of server over streams
+//! kept in memory.
 //!
 //! An entry is fields; this transport carries the Stream as one field,
 //! `body` unless configured otherwise, and reads that field back. Consumer
@@ -23,18 +28,18 @@ pub mod resp;
 pub mod session;
 
 use std::net::TcpListener;
-use std::sync::Mutex;
 use std::time::Duration;
 
 pub use client::{Client, Entry};
 use net::Target;
 pub use resp::Value;
 pub use session::Session;
+use transport::contiguous::Contiguous;
 use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
 use transport::socket;
-use transport::{Arrived, Configured, Directions, Pool, Transport};
+use transport::{Arrived, Configured, Directions, Pool, Taken, Transport};
 use xcore::settings::{Applies, Kind, Presence, Read, Setting, Settings};
 
 pub struct RedisStreamsTransport {
@@ -42,7 +47,9 @@ pub struct RedisStreamsTransport {
     stream: String,
     field: String,
     batch: usize,
-    cursor: Mutex<String>,
+    /// The id the next receive reads after, which an entry's
+    /// acknowledgement moves.
+    cursor: Contiguous<String>,
     timeout: Option<Duration>,
     /// The connections a send appends on and a receive reads on, connected
     /// once per server and kept.
@@ -59,7 +66,7 @@ impl Clone for RedisStreamsTransport {
             stream: self.stream.clone(),
             field: self.field.clone(),
             batch: self.batch,
-            cursor: Mutex::new(self.cursor()),
+            cursor: Contiguous::new(self.cursor()),
             timeout: self.timeout,
             clients: self.clients.clone(),
         }
@@ -76,7 +83,7 @@ impl RedisStreamsTransport {
             stream: stream.into(),
             field: "body".to_string(),
             batch: 100,
-            cursor: Mutex::new("0-0".to_string()),
+            cursor: Contiguous::new("0-0".to_string()),
             timeout: None,
             clients: Pool::new(),
         }
@@ -92,10 +99,7 @@ impl RedisStreamsTransport {
     /// Start reading after this id rather than from the beginning.
     #[must_use]
     pub fn after(self, id: impl Into<String>) -> Self {
-        *self
-            .cursor
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner) = id.into();
+        self.cursor.set(id.into());
         self
     }
 
@@ -109,10 +113,7 @@ impl RedisStreamsTransport {
     /// The id the next receive reads after.
     #[must_use]
     pub fn cursor(&self) -> String {
-        self.cursor
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .clone()
+        self.cursor.at()
     }
 
     /// Connect to the server.
@@ -160,25 +161,32 @@ impl Transport for RedisStreamsTransport {
         Directions::BOTH
     }
 
-    /// The entries after the cursor, the cursor moved to the last of them,
-    /// read on the connection kept for the server.
+    fn arrivals(&self) -> transport::Arrivals {
+        transport::Arrivals::Ordered("a cursor moves only contiguously")
+    }
+
+    /// The entries after the cursor, read on the connection kept for the
+    /// server. Nothing moves the cursor here, and XRANGE consumes nothing
+    /// on the server: each entry's acknowledgement moves the cursor to it
+    /// once the receive cycle accepted it or refused it for good — a log has
+    /// no place to reject an entry into, and a refused one is not read
+    /// again — and leaves it where the cycle failed, so the entry is read
+    /// again.
     fn receive(&self) -> Result<Vec<Arrived>> {
+        let after = self.cursor();
         let entries = self.clients.exchange(
             self.server.as_str(),
             || self.connect(),
-            |client| client.read_after(&self.stream, &self.cursor(), self.batch),
+            |client| client.read_after(&self.stream, &after, self.batch),
         )?;
         let mut arrived = Vec::with_capacity(entries.len());
+        let mut before = after;
         for entry in entries {
             let body = entry.field(&self.field).unwrap_or(&[]).to_vec();
-            arrived.push(Arrived::new(
-                format!("redis://{}/{}/{}", self.server, self.stream, entry.id),
-                body,
-            ));
-            *self
-                .cursor
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner) = entry.id;
+            let origin = format!("redis://{}/{}/{}", self.server, self.stream, entry.id);
+            let acknowledgement = self.cursor.advancing(before, entry.id.clone());
+            arrived.push(Arrived::whole(origin, body, acknowledgement));
+            before = entry.id;
         }
         Ok(arrived)
     }
@@ -259,7 +267,7 @@ impl RedisStreamsTransport {
 }
 
 impl Accepting for RedisStreamsTransport {
-    fn take_one(self, listener: &TcpListener) -> Result<Arrived> {
+    fn take_one(self, listener: &TcpListener) -> Result<Taken> {
         self.accept_one(listener)?
             .next_add()?
             .ok_or_else(|| protocol_error("the client closed without appending"))
@@ -353,10 +361,20 @@ mod tests {
                 RedisStreamsTransport::new(address.clone(), "orders").timing_out_after(secs(2));
             near.send("orders", b"first")?;
             near.send(&format!("redis://{address}/orders"), b"second\r\n\0")?;
-            let first = near.receive()?;
-            let cursor = near.cursor();
+            near.send("orders", b"third")?;
+            let mut first = near.receive()?.into_iter();
+            let one = first.next().expect("1-0").taken()?;
+            let two = first.next().expect("2-0");
+            assert!(two.defers());
+            two.refused(transport::Refusal::Unacceptable)?;
+            let refused = near.cursor();
+            first.next().expect("3-0").failed()?;
+            let failed = near.cursor();
+            let again = transport::arrived::one_arrival(near.receive()?, "read again")?.taken()?;
+            let cursors = [refused, failed, near.cursor()];
             let rest = near.receive()?;
-            Ok::<_, transport::TransportError>((first, cursor, rest, near.clients.opened()))
+            let read = (one, cursors, again);
+            Ok::<_, transport::TransportError>((read, rest, near.clients.opened()))
         });
         // One server, so one connection for both sends and both receives.
         let mut session = far_end.accept_one(&listener).expect("accepting");
@@ -366,11 +384,20 @@ mod tests {
         let two = session.next_add().expect("second").expect("an entry");
         assert_eq!(two.bytes, b"second\r\n\0");
         assert!(two.origin_uri.ends_with("/orders/2-0"));
+        let three = session.next_add().expect("third").expect("an entry");
         assert!(session.next_add().expect("serving the reads").is_none());
-        let (first, cursor, rest, opened) = near.join().expect("thread").expect("round trip");
-        assert_eq!(first.len(), 2, "what the kept connection appended");
-        assert_eq!(first[1].bytes, two.bytes);
-        assert_eq!(cursor, "2-0");
+        let (read, rest, opened) = near.join().expect("thread").expect("round trip");
+        let (first, cursors, again) = read;
+        assert_eq!(first.bytes, one.bytes);
+        assert_eq!(
+            cursors,
+            ["2-0", "2-0", "3-0"],
+            "a refused 2-0 moves the cursor to it, a failed 3-0 leaves it"
+        );
+        assert_eq!(
+            again.bytes, three.bytes,
+            "only the failed entry is read again"
+        );
         assert!(rest.is_empty(), "read on from the cursor");
         assert_eq!(opened, 1);
     }
