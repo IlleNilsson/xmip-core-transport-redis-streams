@@ -34,6 +34,7 @@ pub use client::{Client, Entry};
 use net::Target;
 pub use resp::Value;
 pub use session::Session;
+use transport::ArrivalIdentity;
 use transport::contiguous::Contiguous;
 use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
@@ -185,7 +186,7 @@ impl Transport for RedisStreamsTransport {
             let body = entry.field(&self.field).unwrap_or(&[]).to_vec();
             let origin = format!("redis://{}/{}/{}", self.server, self.stream, entry.id);
             let acknowledgement = self.cursor.advancing(before, entry.id.clone());
-            arrived.push(Arrived::whole(origin, body, acknowledgement));
+            arrived.push(Arrived::whole(origin, body, acknowledgement).detected());
             before = entry.id;
         }
         Ok(arrived)
@@ -275,6 +276,12 @@ impl Accepting for RedisStreamsTransport {
 }
 
 impl Loopback for RedisStreamsTransport {
+    fn arrival_identity(&self) -> ArrivalIdentity {
+        ArrivalIdentity::Unnamed(
+            "the broker delivers it and names no sender; the peer is the broker",
+        )
+    }
+
     fn far_end(&self) -> Result<Box<dyn FarEnd>> {
         Ok(Box::new(Listening::new(self.clone(), self.bind()?)))
     }
