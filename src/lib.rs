@@ -166,6 +166,10 @@ impl Transport for RedisStreamsTransport {
         transport::Arrivals::Ordered("a cursor moves only contiguously")
     }
 
+    fn waiting(&self) -> transport::Waiting {
+        transport::Waiting::Polled("an XRANGE returns at once with what is after the cursor")
+    }
+
     /// The entries after the cursor, read on the connection kept for the
     /// server. Nothing moves the cursor here, and XRANGE consumes nothing
     /// on the server: each entry's acknowledgement moves the cursor to it
