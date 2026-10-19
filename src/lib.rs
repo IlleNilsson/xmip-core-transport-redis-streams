@@ -177,12 +177,12 @@ impl Transport for RedisStreamsTransport {
     /// no place to reject an entry into, and a refused one is not read
     /// again — and leaves it where the cycle failed, so the entry is read
     /// again.
-    fn receive(&self) -> Result<Vec<Arrived>> {
+    fn receive_up_to(&self, most: usize) -> Result<Vec<Arrived>> {
         let after = self.cursor();
         let entries = self.clients.exchange(
             self.server.as_str(),
             || self.connect(),
-            |client| client.read_after(&self.stream, &after, self.batch),
+            |client| client.read_after(&self.stream, &after, self.batch.min(most)),
         )?;
         let mut arrived = Vec::with_capacity(entries.len());
         let mut before = after;
@@ -196,9 +196,14 @@ impl Transport for RedisStreamsTransport {
         Ok(arrived)
     }
 
+    fn sending(&self) -> transport::Sending {
+        transport::Sending::Gathered("one XADD carries the whole body as one field")
+    }
+
     /// XADD on the connection kept for the server, connected on the first
     /// send to it.
-    fn send(&self, target: &str, bytes: &[u8]) -> Result<()> {
+    fn send_from(&self, target: &str, outgoing: transport::Outgoing<'_>) -> Result<()> {
+        let bytes: &[u8] = &outgoing.gather()?;
         let (server, stream) = self.resolve(target);
         self.clients.exchange(
             server,
