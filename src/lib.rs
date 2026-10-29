@@ -145,7 +145,7 @@ impl RedisStreamsTransport {
     /// `redis://host:6379/orders` — or is a stream alone on this
     /// transport's server.
     fn resolve<'a>(&'a self, target: &'a str) -> (&'a str, &'a str) {
-        match Target::under(&["redis"], target).map(|named| (named.authority(), named.path())) {
+        match Target::under(Self::SCHEMES, target).map(|named| (named.authority(), named.path())) {
             Some((peer, "")) => (peer, &self.stream),
             Some(pair) => pair,
             None => (&self.server, target),
@@ -251,6 +251,9 @@ impl Configured for RedisStreamsTransport {
             },
         ],
     };
+
+    /// The schemes a Location's address is entered with to choose this technology.
+    const SCHEMES: &'static [&'static str] = &["redis"];
 
     fn configured(address: &str, settings: &Read) -> Result<Self> {
         let mut transport = Self::new(address, settings.text("stream"));
