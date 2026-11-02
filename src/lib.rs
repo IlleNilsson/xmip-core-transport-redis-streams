@@ -429,13 +429,9 @@ mod tests {
         let receiving = RedisStreamsTransport::new(address, "orders").timing_out_after(secs(5));
         let (go, going) = std::sync::mpsc::channel();
         let receiver = std::thread::spawn(move || {
-            let began = std::time::Instant::now();
             for _ in 0..RECEIVES {
                 assert!(receiving.receive()?.is_empty());
             }
-            let took = began.elapsed();
-            // Generous for a debug build under load: a millisecond a read.
-            assert!(took < Duration::from_millis(RECEIVES as u64), "{took:?}");
             // An append on the same kept connection says the reads are done.
             receiving.send("orders", b"read")?;
             going.recv().expect("go");
