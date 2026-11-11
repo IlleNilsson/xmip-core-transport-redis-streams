@@ -36,6 +36,7 @@ pub use resp::Value;
 pub use session::Session;
 use transport::ArrivalIdentity;
 use transport::contiguous::Contiguous;
+use transport::destination;
 use transport::error::{Result, protocol_error};
 use transport::listening::{Accepting, Listening};
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
@@ -143,13 +144,11 @@ impl RedisStreamsTransport {
 
     /// Where a target names the server and stream itself —
     /// `redis://host:6379/orders` — or is a stream alone on this
-    /// transport's server.
+    /// transport's server, or empty and this transport's stream
+    /// (`transport::destination::on_server`).
     fn resolve<'a>(&'a self, target: &'a str) -> (&'a str, &'a str) {
-        match Target::under(Self::SCHEMES, target).map(|named| (named.authority(), named.path())) {
-            Some((peer, "")) => (peer, &self.stream),
-            Some(pair) => pair,
-            None => (&self.server, target),
-        }
+        let named = Target::under(Self::SCHEMES, target);
+        destination::on_server(target, named, (&self.server, &self.stream))
     }
 }
 
@@ -255,6 +254,11 @@ impl Configured for RedisStreamsTransport {
     /// The schemes a Location's address is entered with to choose this technology.
     const SCHEMES: &'static [&'static str] = &["redis"];
 
+    /// The stream setting: the address names only the server.
+    fn own_target(_address: &str) -> &str {
+        destination::OWN
+    }
+
     fn configured(address: &str, settings: &Read) -> Result<Self> {
         let mut transport = Self::new(address, settings.text("stream"));
         if let Some(field) = settings.optional_text("field") {
@@ -338,6 +342,33 @@ mod tests {
             panic!("a Send Location reads no cursor");
         };
         assert!(refused.message.contains("\"after\""), "{refused}");
+    }
+
+    #[test]
+    fn a_send_location_appends_to_its_stream_and_a_target_naming_another_wins() {
+        use xcore::settings::Given;
+        let far_end = RedisStreamsTransport::new("127.0.0.1:0", "orders").timing_out_after(secs(2));
+        let (listener, address) = far_end.bind().expect("binding");
+        let location = format!("redis://{address}");
+        let near = std::thread::spawn(move || {
+            let given = [
+                ("stream".to_string(), Given::Text("orders".to_string())),
+                ("timeout".to_string(), Given::Text("2s".to_string())),
+            ];
+            let near = RedisStreamsTransport::open(&location, Applies::Send, &given)?;
+            near.send(RedisStreamsTransport::own_target(&location), b"own")?;
+            near.send("invoices", b"other")
+        });
+        let mut session = far_end.accept_one(&listener).expect("accepting");
+        let own = session.next_add().expect("own").expect("an entry");
+        assert!(own.origin_uri.contains("/orders/"), "{}", own.origin_uri);
+        let other = session.next_add().expect("other").expect("an entry");
+        assert!(
+            other.origin_uri.contains("/invoices/"),
+            "{}",
+            other.origin_uri
+        );
+        near.join().expect("thread").expect("appending");
     }
 
     #[test]
