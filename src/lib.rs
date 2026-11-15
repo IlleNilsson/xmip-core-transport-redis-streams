@@ -105,13 +105,6 @@ impl RedisStreamsTransport {
         self
     }
 
-    /// Give up on a server that stops mid-reply.
-    #[must_use]
-    pub const fn timing_out_after(mut self, timeout: Duration) -> Self {
-        self.timeout = Some(timeout);
-        self
-    }
-
     /// The id the next receive reads after.
     #[must_use]
     pub fn cursor(&self) -> String {
@@ -240,14 +233,12 @@ impl Configured for RedisStreamsTransport {
                           beginning when left out.",
                 applies: Applies::Receive,
             },
-            Setting {
-                name: "timeout",
-                kind: Kind::Duration,
-                presence: Presence::Optional,
-                meaning: "How long a server that stops mid-reply is waited on; unbounded when \
-                          left out.",
-                applies: Applies::Both,
-            },
+            transport::configured::timeout(
+                Applies::Both,
+                None,
+                "How long a server that stops mid-reply is waited on; unbounded when \
+                 left out.",
+            ),
         ],
     };
 
@@ -259,6 +250,10 @@ impl Configured for RedisStreamsTransport {
         destination::OWN
     }
 
+    fn timeout_kept(&mut self) -> Option<&mut dyn transport::configured::TimeoutKept> {
+        Some(&mut self.timeout)
+    }
+
     fn configured(address: &str, settings: &Read) -> Result<Self> {
         let mut transport = Self::new(address, settings.text("stream"));
         if let Some(field) = settings.optional_text("field") {
@@ -266,9 +261,6 @@ impl Configured for RedisStreamsTransport {
         }
         if let Some(id) = settings.optional_text("after") {
             transport = transport.after(id);
-        }
-        if let Some(timeout) = settings.optional_duration("timeout") {
-            transport = transport.timing_out_after(timeout);
         }
         Ok(transport)
     }
