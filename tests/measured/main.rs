@@ -6,12 +6,19 @@
 //! (`cargo test --test measured --all-features -- --test-threads=1`), so
 //! what is measured is Xmip's work and not its neighbors':
 //!
-//! - a thousand reads on one connection take a millisecond each at most.
+//! - a thousand reads on one connection take a millisecond each at most
+//!   beyond their wakes, round by round beside a plain wake, the fastest of
+//!   five (`xcore::latency::Rounds`).
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use transport::Transport;
+use xcore::latency::Rounds;
 use xmip_core_transport_redis_streams::RedisStreamsTransport;
+
+/// What a read wakes where a plain wake wakes one: the far end at the
+/// XRANGE, and this end at its answer.
+const WAKES: u32 = 2;
 
 fn secs(n: u64) -> Duration {
     Duration::from_secs(n)
@@ -24,18 +31,16 @@ fn a_thousand_reads_take_a_millisecond_each_at_most() {
     let (listener, address) = far_end.bind().expect("binding");
     let receiving = RedisStreamsTransport::new(address, "orders").timing_out_after(secs(5));
     let receiver = std::thread::spawn(move || {
-        let began = Instant::now();
+        let mut rounds = Rounds::crossing(WAKES);
         for _ in 0..RECEIVES {
-            assert!(receiving.receive()?.is_empty());
+            assert!(rounds.round(|| receiving.receive())?.is_empty());
         }
-        let took = began.elapsed();
-        // Generous for a debug build under load: a millisecond a read.
-        assert!(took < Duration::from_millis(RECEIVES as u64), "{took:?}");
-        Ok::<_, transport::TransportError>(())
+        Ok::<_, transport::TransportError>(rounds)
     });
     // Served, every read answered, until the near end lets its
     // connection go.
     let mut session = far_end.accept_one(&listener).expect("accepting");
     assert!(session.next_add().expect("served").is_none());
-    receiver.join().expect("thread").expect("read");
+    let rounds = receiver.join().expect("thread").expect("read");
+    rounds.hold("a read");
 }
