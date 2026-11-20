@@ -63,13 +63,11 @@ impl Session {
                 .collect();
             let verb = arguments
                 .first()
-                .map(|v| String::from_utf8_lossy(v).to_ascii_uppercase())
-                .unwrap_or_default();
+                .map_or_default(|v| String::from_utf8_lossy(v).to_ascii_uppercase());
             let text = |i: usize| {
                 arguments
                     .get(i)
-                    .map(|a| String::from_utf8_lossy(a).into_owned())
-                    .unwrap_or_default()
+                    .map_or_default(|a| String::from_utf8_lossy(a).into_owned())
             };
             match verb.as_str() {
                 "PING" => self.reply(&Value::Simple("PONG".into()))?,
