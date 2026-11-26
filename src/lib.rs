@@ -22,28 +22,48 @@
 //!
 //! The origin URI carries what the server knew:
 //! `redis://server/orders/1699999999999-0`.
+//!
+//! **Built with its `declaration` feature alone** the crate is
+//! [`declaration`], what a Location of it is configured with, and none of
+//! the code above, which is behind the default feature: what the surfaces'
+//! library carries (ADR-0064, amendment 2026-11-26).
 
+#[cfg(feature = "default")]
 pub mod client;
+#[cfg(feature = "declaration")]
+pub mod declaration;
+#[cfg(feature = "default")]
 pub mod resp;
+#[cfg(feature = "default")]
 pub mod session;
 
+#[cfg(feature = "default")]
 use std::net::TcpListener;
+#[cfg(feature = "default")]
 use std::time::Duration;
 
+#[cfg(feature = "default")]
 pub use client::{Client, Entry};
+#[cfg(feature = "default")]
 use net::Target;
+#[cfg(feature = "default")]
 pub use resp::Value;
+#[cfg(feature = "default")]
 pub use session::Session;
-use transport::ArrivalIdentity;
-use transport::contiguous::Contiguous;
-use transport::destination;
+#[cfg(feature = "default")]
 use transport::error::{Result, protocol_error};
+#[cfg(feature = "default")]
 use transport::listening::{Accepting, Listening};
+#[cfg(feature = "default")]
 use transport::loopback::{FarEnd, LOOPBACK_TIMEOUT, Loopback};
-use transport::socket;
+#[cfg(feature = "default")]
+use transport::{ArrivalIdentity, contiguous::Contiguous, destination, socket};
+#[cfg(feature = "default")]
 use transport::{Arrived, Configured, Directions, Pool, Taken, Transport};
-use xcore::settings::{Applies, Kind, Presence, Read, Setting, Settings};
+#[cfg(feature = "default")]
+use xcore::settings::{Read, Settings};
 
+#[cfg(feature = "default")]
 pub struct RedisStreamsTransport {
     server: String,
     stream: String,
@@ -58,6 +78,7 @@ pub struct RedisStreamsTransport {
     clients: Pool<Client>,
 }
 
+#[cfg(feature = "default")]
 impl Clone for RedisStreamsTransport {
     /// The same server, stream and field, and the cursor as it stands now
     /// — a copy reads on from where this one has got to, not from the
@@ -75,6 +96,7 @@ impl Clone for RedisStreamsTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl RedisStreamsTransport {
     /// Speak to the server at `server` about the stream `stream`, reading
     /// from its beginning.
@@ -145,6 +167,7 @@ impl RedisStreamsTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Transport for RedisStreamsTransport {
     fn name(&self) -> &'static str {
         "redis-streams"
@@ -205,45 +228,10 @@ impl Transport for RedisStreamsTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Configured for RedisStreamsTransport {
-    /// The address is the server, `host:6379`: where a Location connects.
-    const SETTINGS: &'static Settings = &Settings {
-        technology: env!("CARGO_PKG_NAME"),
-        settings: &[
-            Setting {
-                name: "stream",
-                kind: Kind::Text,
-                presence: Presence::Required,
-                meaning: "The stream key a Receive Location reads and a Send Location appends to \
-                          when a target names no stream.",
-                applies: Applies::Both,
-            },
-            Setting {
-                name: "field",
-                kind: Kind::Text,
-                presence: Presence::Optional,
-                meaning: "The entry field that carries the Stream; `body` when left out.",
-                applies: Applies::Both,
-            },
-            Setting {
-                name: "after",
-                kind: Kind::Text,
-                presence: Presence::Optional,
-                meaning: "The entry id a Receive Location starts reading after; the stream's \
-                          beginning when left out.",
-                applies: Applies::Receive,
-            },
-            transport::configured::timeout(
-                Applies::Both,
-                None,
-                "How long a server that stops mid-reply is waited on; unbounded when \
-                 left out.",
-            ),
-        ],
-    };
-
-    /// The schemes a Location's address is entered with to choose this technology.
-    const SCHEMES: &'static [&'static str] = &["redis"];
+    const SETTINGS: &'static Settings = declaration::SETTINGS;
+    const SCHEMES: &'static [&'static str] = declaration::SCHEMES;
 
     /// The stream setting: the address names only the server.
     fn own_target(_address: &str) -> &str {
@@ -266,6 +254,7 @@ impl Configured for RedisStreamsTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl RedisStreamsTransport {
     /// Both ends on this machine: an ephemeral local port, the stream
     /// `probe`, the loopback timeout on every read.
@@ -275,6 +264,7 @@ impl RedisStreamsTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Accepting for RedisStreamsTransport {
     fn take_one(self, listener: &TcpListener) -> Result<Taken> {
         self.accept_one(listener)?
@@ -283,6 +273,7 @@ impl Accepting for RedisStreamsTransport {
     }
 }
 
+#[cfg(feature = "default")]
 impl Loopback for RedisStreamsTransport {
     fn arrival_identity(&self) -> ArrivalIdentity {
         ArrivalIdentity::Unnamed(
@@ -306,6 +297,7 @@ impl Loopback for RedisStreamsTransport {
 mod tests {
     use super::*;
     use transport::payload::edge_payloads;
+    use xcore::settings::Applies;
 
     fn secs(n: u64) -> Duration {
         Duration::from_secs(n)
